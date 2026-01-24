@@ -9,7 +9,9 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, CallbackQueryHandler
 from telegram.ext.callbackcontext import CallbackContext
 
-from sqlalchemy import create_engine, Column, Integer, String, DateTime
+from sqlalchemy import (
+    create_engine, Column, Integer, String, DateTime, func
+)
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 # ================= CONFIG =================
@@ -33,15 +35,21 @@ class Transaction(Base):
     __tablename__ = "transactions"
     id = Column(Integer, primary_key=True)
     group_id = Column(Integer)
-    type = Column(String)  # deposit, withdraw, delivery, commission, carryover
+    type = Column(String)  # deposit, withdraw, delivery, carryover
     amount = Column(Integer)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+class DailyCommission(Base):
+    __tablename__ = "daily_commissions"
+    id = Column(Integer, primary_key=True)
+    group_id = Column(Integer)
+    date = Column(String)  # YYYY-MM-DD
+    percent = Column(Integer)
 
 Base.metadata.create_all(engine)
 
 # ================= MEMORY =================
-pending_actions = {}
-# (chat_id, user_id) -> {type, amount}
+pending_actions = {}  # (chat_id, user_id) -> {type, amount}
 
 # ================= HELPERS =================
 def parse_amount(text):
@@ -51,15 +59,12 @@ def parse_amount(text):
     return int(s) if s else None
 
 def parse_percentage(text):
-    if not text:
+    if not text or "%" not in text:
         return None
-    text = text.replace(",", ".")
-    if "%" in text:
-        try:
-            return float(text.replace("%", ""))
-        except ValueError:
-            return None
-    return None
+    try:
+        return float(text.replace("%", "").replace(",", "."))
+    except ValueError:
+        return None
 
 def get_group(db, chat_id):
     g = db.query(Group).filter_by(chat_id=str(chat_id)).first()
@@ -73,27 +78,12 @@ def add_tx(db, group_id, ttype, amount):
     db.add(Transaction(group_id=group_id, type=ttype, amount=amount))
     db.commit()
 
-def last_manual_carry(db, group_id):
+def last_carry(db, group_id):
     tx = db.query(Transaction).filter(
         Transaction.group_id == group_id,
         Transaction.type == "carryover"
     ).order_by(Transaction.id.desc()).first()
     return tx.amount if tx else 0
-
-def calculate_net_until(db, group_id, until_date):
-    base = last_manual_carry(db, group_id)
-    txs = db.query(Transaction).filter(
-        Transaction.group_id == group_id,
-        Transaction.created_at.date() <= until_date,
-        Transaction.type != "carryover"
-    ).all()
-
-    d = sum(t.amount for t in txs if t.type == "deposit")
-    w = sum(t.amount for t in txs if t.type == "withdraw")
-    t = sum(t.amount for t in txs if t.type == "delivery")
-    c = sum(t.amount for t in txs if t.type == "commission")
-
-    return base + d - w - t - c
 
 # ================= CORE =================
 def start(update: Update, ctx: CallbackContext):
@@ -102,7 +92,7 @@ def start(update: Update, ctx: CallbackContext):
     db.close()
     update.message.reply_text("✅ Grup kayıt edildi.")
 
-def process_action(update, ctx, action_type, amount):
+def process_action(update, action_type, amount):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
 
@@ -111,12 +101,10 @@ def process_action(update, ctx, action_type, amount):
             "type": action_type,
             "amount": amount
         }
-        kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("✅ Onayla", callback_data="confirm"),
-                InlineKeyboardButton("❌ İptal", callback_data="cancel")
-            ]
-        ])
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Onayla", callback_data="confirm"),
+            InlineKeyboardButton("❌ İptal", callback_data="cancel")
+        ]])
         return update.message.reply_text(
             f"⚠️ {amount:,} TL işlem onayı\nEmin misin?",
             reply_markup=kb
@@ -126,7 +114,7 @@ def process_action(update, ctx, action_type, amount):
     g = get_group(db, chat_id)
     add_tx(db, g.id, action_type, amount)
     db.close()
-    update.message.reply_text(f"✅ İşlem kaydedildi: {amount:,}")
+    update.message.reply_text(f"✅ Kaydedildi: {amount:,}")
 
 def handle_callback(update: Update, ctx: CallbackContext):
     q = update.callback_query
@@ -143,9 +131,9 @@ def handle_callback(update: Update, ctx: CallbackContext):
         g = get_group(db, q.message.chat_id)
         add_tx(db, g.id, action["type"], action["amount"])
         db.close()
-        q.edit_message_text(f"✅ İşlem onaylandı: {action['amount']:,}")
+        q.edit_message_text(f"✅ Onaylandı: {action['amount']:,}")
     else:
-        q.edit_message_text("❌ İşlem iptal edildi.")
+        q.edit_message_text("❌ İptal edildi.")
 
     pending_actions.pop(key, None)
 
@@ -154,66 +142,60 @@ def yatirim(u, c):
     amt = parse_amount(c.args[0]) if c.args else None
     if not amt:
         return u.message.reply_text("Kullanım: /yatirim 100000")
-    process_action(u, c, "deposit", amt)
+    process_action(u, "deposit", amt)
 
 def cekim(u, c):
     amt = parse_amount(c.args[0]) if c.args else None
     if not amt:
         return u.message.reply_text("Kullanım: /cekim 50000")
-    process_action(u, c, "withdraw", amt)
+    process_action(u, "withdraw", amt)
 
 def teslimat(u, c):
     amt = parse_amount(c.args[0]) if c.args else None
     if not amt:
         return u.message.reply_text("Kullanım: /teslimat 30000")
-    process_action(u, c, "delivery", amt)
+    process_action(u, "delivery", amt)
 
 def komisyon(update: Update, ctx: CallbackContext):
-    arg = ctx.args[0] if ctx.args else None
-    if not arg:
-        return update.message.reply_text("Kullanım: /komisyon 5000 veya /komisyon %14")
+    percent = parse_percentage(ctx.args[0]) if ctx.args else None
+    if percent is None:
+        return update.message.reply_text("Kullanım: /komisyon %14")
 
-    percent = parse_percentage(arg)
     db = Session()
     g = get_group(db, update.effective_chat.id)
+    today = date.today().isoformat()
 
-    if percent is not None:
-        today = date.today()
-        txs = db.query(Transaction).filter(
-            Transaction.group_id == g.id,
-            Transaction.type == "deposit",
-            Transaction.created_at.date() == today
-        ).all()
+    db.query(DailyCommission).filter_by(
+        group_id=g.id,
+        date=today
+    ).delete()
 
-        total = sum(t.amount for t in txs)
-        if total == 0:
-            db.close()
-            return update.message.reply_text("❌ Bugün yatırım yok.")
-
-        amt = int(total * (percent / 100))
-        db.close()
-        return process_action(update, ctx, "commission", amt)
-
-    amt = parse_amount(arg)
-    if not amt:
-        db.close()
-        return update.message.reply_text("Geçersiz komisyon.")
+    db.add(DailyCommission(
+        group_id=g.id,
+        date=today,
+        percent=int(percent)
+    ))
+    db.commit()
     db.close()
-    process_action(update, ctx, "commission", amt)
+
+    update.message.reply_text(f"💸 Bugünkü komisyon %{int(percent)} olarak ayarlandı.")
 
 def devir(update: Update, ctx: CallbackContext):
     amt = parse_amount(ctx.args[0]) if ctx.args else None
     if amt is None:
         return update.message.reply_text("Kullanım: /devir 250000")
+
     db = Session()
     g = get_group(db, update.effective_chat.id)
     add_tx(db, g.id, "carryover", amt)
     db.close()
+
     update.message.reply_text(f"♻️ Devir güncellendi: {amt:,}")
 
 def geri(update: Update, ctx: CallbackContext):
     db = Session()
     g = get_group(db, update.effective_chat.id)
+
     tx = db.query(Transaction).filter(
         Transaction.group_id == g.id,
         Transaction.type != "carryover"
@@ -233,30 +215,34 @@ def durum(update: Update, ctx: CallbackContext):
     g = get_group(db, update.effective_chat.id)
 
     yesterday = date.today() - timedelta(days=1)
-    devir = calculate_net_until(db, g.id, yesterday)
+    carry = last_carry(db, g.id)
 
-    today = date.today()
     txs = db.query(Transaction).filter(
         Transaction.group_id == g.id,
-        Transaction.created_at.date() == today,
-        Transaction.type != "carryover"
+        func.date(Transaction.created_at) == str(date.today())
     ).all()
-    db.close()
 
     d = sum(t.amount for t in txs if t.type == "deposit")
     w = sum(t.amount for t in txs if t.type == "withdraw")
     t = sum(t.amount for t in txs if t.type == "delivery")
-    c = sum(t.amount for t in txs if t.type == "commission")
 
-    net = devir + d - w - t - c
+    dc = db.query(DailyCommission).filter_by(
+        group_id=g.id,
+        date=date.today().isoformat()
+    ).first()
+
+    commission = int(d * (dc.percent / 100)) if dc else 0
+    net = carry + d - w - t - commission
+
+    db.close()
 
     update.message.reply_text(
         f"📊 Kasa Durumu\n\n"
-        f"Devir: {devir:,}\n"
+        f"Devir: {carry:,}\n"
         f"Yatırım: {d:,}\n"
         f"Çekim: {w:,}\n"
         f"Teslimat: {t:,}\n"
-        f"Komisyon: {c:,}\n\n"
+        f"Komisyon: {commission:,}\n\n"
         f"💰 Net: {net:,}"
     )
 

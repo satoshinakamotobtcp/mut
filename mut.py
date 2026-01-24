@@ -15,7 +15,7 @@ from sqlalchemy import create_engine, Column, Integer, String, DateTime
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 # ================= CONFIG =================
-TELEGRAM_TOKEN = "BOT_TOKENİNİ_YAZ"
+TELEGRAM_TOKEN = "8559555118:AAEOSO28H1yPajKXNPjbViWz4NVB5FVG3Ms"
 DB_URL = "sqlite:///mutabakat.db"
 CONFIRM_LIMIT = 100_000
 
